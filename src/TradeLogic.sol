@@ -116,7 +116,7 @@ contract TradeLogic is PerpStore {
         }
         address account = p.owner;
         int256 closedPnl = _pnl(p.sizeTokens, p.sizeUsd, mark, p.isLong);
-        _applyReservingCharge(vault, _reservingFeeTokens(p, vault.accReservingRate));
+        _book(m, p.isLong).borrowEntrySum -= p.sizeUsd * p.entryReservingRate;
         _book(m, p.isLong)
         .unrealisedFundingUsd -= _fundingPayment(p, _book(m, p.isLong).accFundingRate, p.sizeUsd);
         _book(m, p.isLong).realisedPnlUsd += closedPnl > 0 ? -closedPnl : closedPnl;

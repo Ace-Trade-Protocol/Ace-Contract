@@ -290,10 +290,6 @@ contract AcePerp is PerpStore {
         _delegate(poolLogic);
     }
 
-    function setReservingFee(uint32, address, uint64) external {
-        _delegate(poolLogic);
-    }
-
     function setVaultBounds(uint32, address, uint256, uint256) external {
         _delegate(poolLogic);
     }

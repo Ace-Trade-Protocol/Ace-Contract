@@ -48,8 +48,7 @@ abstract contract PerpStore is Ownable2Step {
         address vault;
     }
 
-    /// @dev `liquidity` and `reserved` are token units. `unrealisedReservingFee` is token units
-    /// times WAD, so a fractional fee still counts in the LP price.
+    /// @dev `liquidity` and `reserved` are token units. Borrow is accrued on the market, per side.
     struct TokenVault {
         uint256 liquidity;
         uint256 reserved;
@@ -71,16 +70,20 @@ abstract contract PerpStore is Ownable2Step {
         uint64 maintenanceMarginWad;
         uint64 tradeFeeWad;
         uint64 liquidationFeeWad;
+        /// @notice Per-second borrow rate, in wad, charged at 100% of pool value on the heavier side.
         uint64 borrowingFactorPerSecondWad;
         uint64 reserveFactorWad;
     }
 
-    /// @dev One book per direction. Long and short share the LP vaults and keep separate funding.
+    /// @dev One book per direction. Long and short share the LP vaults and keep separate funding
+    /// and borrow indexes.
     struct SideBook {
         int256 realisedPnlUsd;
         int256 unrealisedFundingUsd;
         int256 accFundingRate;
         uint64 lastUpdate;
+        uint256 accBorrowRate;
+        uint256 borrowEntrySum;
     }
 
     struct Market {
@@ -324,6 +327,7 @@ abstract contract PerpStore is Ownable2Step {
         positionId = nextPositionId++;
         uint256 sizeTokens = MathX.mulDiv(size, WAD, q.executionPrice);
         int256 entryFunding = _book(m, isLong).accFundingRate;
+        uint256 borrowIndex = _book(m, isLong).accBorrowRate;
         positions[positionId] = Position(
             account,
             id,
@@ -334,12 +338,13 @@ abstract contract PerpStore is Ownable2Step {
             size,
             sizeTokens,
             q.executionPrice,
-            vault.accReservingRate,
+            borrowIndex,
             entryFunding
         );
         _addSize(m, isLong, sizeTokens);
         m.longOiUsd = q.longOiAfter;
         m.shortOiUsd = q.shortOiAfter;
+        _book(m, isLong).borrowEntrySum += size * borrowIndex;
         _requireHealthy(positions[positionId], m);
         emit PositionOpened(
             positionId, account, id, isLong, collateralToken, size, net, q.executionPrice
@@ -401,11 +406,11 @@ abstract contract PerpStore is Ownable2Step {
             p.sizeTokens += addedTokens;
             p.entryPrice = MathX.mulDiv(p.sizeUsd, WAD, p.sizeTokens);
             _addSize(m, p.isLong, addedTokens);
+            _book(m, p.isLong).borrowEntrySum += sizeDelta * p.entryReservingRate;
             m.longOiUsd = q.longOiAfter;
             m.shortOiUsd = q.shortOiAfter;
             price = q.executionPrice;
         }
-        p.entryReservingRate = vault.accReservingRate;
         p.entryFundingIndex = _book(m, p.isLong).accFundingRate;
         _requireHealthy(p, m);
         emit PositionIncreased(id, sizeDelta, collateralDelta, price);
@@ -448,7 +453,7 @@ abstract contract PerpStore is Ownable2Step {
         MarketPoolToken pool = _vault(m);
         address token = p.collateralToken;
         bool closed = sizeDelta == oldSize;
-        uint256 reservingTokens = _reservingFeeTokens(p, vault.accReservingRate);
+        uint256 reservingTokens = _borrowFeeTokens(m, p, cp.minPrice, scale);
         uint256 feeTokens =
             _toTokenUp(MathX.mulDivUp(sizeDelta, m.config.tradeFeeWad, WAD), cp.minPrice, scale);
         uint256 fundingPay = funding > 0 ? _toToken(uint256(funding), cp.minPrice, scale) : 0;
@@ -463,9 +468,9 @@ abstract contract PerpStore is Ownable2Step {
             fundingPay = MathX.min(fundingPay, room);
         }
         p.collateralAmount -= feeTokens + reservingTokens + fundingPay;
-        vault.liquidity += reservingTokens + fundingPay;
+        vault.liquidity += fundingPay;
+        vault.liquidity += _routeFee(pool, token, reservingTokens, address(0));
         vault.liquidity += _routeFee(pool, token, feeTokens, keeper);
-        _applyReservingCharge(vault, reservingTokens);
         uint256 profitTokens;
         uint256 lossTokens;
         if (rawPnl > 0) {
@@ -508,6 +513,7 @@ abstract contract PerpStore is Ownable2Step {
         if (rawPnl > 0) {
             payout += _pullWinFund(address(pool), token, uint256(rawPnl), cp.minPrice, scale);
         }
+        _syncBorrow(m, p, closed ? 0 : oldSize - sizeDelta);
         if (closed) {
             payout += p.collateralAmount;
             vault.reserved -= p.reservedAmount;
@@ -517,7 +523,6 @@ abstract contract PerpStore is Ownable2Step {
             if (p.sizeUsd - sizeDelta < m.config.minPositionSizeUsd) revert InvalidAmount();
             p.sizeUsd -= sizeDelta;
             p.sizeTokens -= tokensClosed;
-            p.entryReservingRate = vault.accReservingRate;
             p.entryFundingIndex = _book(m, p.isLong).accFundingRate;
             _requireHealthy(p, m);
         }
@@ -533,11 +538,11 @@ abstract contract PerpStore is Ownable2Step {
         uint256 price,
         uint256 scale
     ) internal {
-        uint256 feeTokens = _reservingFeeTokens(p, vault.accReservingRate);
+        uint256 feeTokens = _borrowFeeTokens(m, p, price, scale);
         if (feeTokens > p.collateralAmount) feeTokens = p.collateralAmount;
         p.collateralAmount -= feeTokens;
-        vault.liquidity += feeTokens;
-        _applyReservingCharge(vault, feeTokens);
+        vault.liquidity += _routeFee(_vault(m), p.collateralToken, feeTokens, address(0));
+        _syncBorrow(m, p, p.sizeUsd);
         int256 funding = _fundingPayment(p, _book(m, p.isLong).accFundingRate, p.sizeUsd);
         _book(m, p.isLong).unrealisedFundingUsd -= funding;
         if (funding > 0) {
@@ -574,13 +579,10 @@ abstract contract PerpStore is Ownable2Step {
         uint256 collateralPrice,
         uint256 scale
     ) internal view returns (int256) {
-        TokenVault storage vault = tokenVaults[m.poolId][p.collateralToken];
-        (uint256 accRate,,) = _projectVault(vault);
         (int256 longRate, int256 shortRate,,,) = _projectFunding(m);
         int256 fundingRate = p.isLong ? longRate : shortRate;
         return int256(_toUsd(p.collateralAmount, collateralPrice, scale))
-            + _pnl(p.sizeTokens, p.sizeUsd, mark, p.isLong)
-            - int256(_toUsd(_reservingFeeTokens(p, accRate), collateralPrice, scale))
+            + _pnl(p.sizeTokens, p.sizeUsd, mark, p.isLong) - int256(_borrowFeeUsd(m, p))
             - _fundingPayment(p, fundingRate, p.sizeUsd);
     }
 
@@ -614,13 +616,53 @@ abstract contract PerpStore is Ownable2Step {
         return payment;
     }
 
-    function _reservingFeeTokens(Position storage p, uint256 accRate)
+    function _borrowFeeUsd(Market storage m, Position storage p) internal view returns (uint256) {
+        uint256 idx = _projectedBorrowRate(m, p.isLong);
+        if (idx <= p.entryReservingRate || p.sizeUsd == 0) return 0;
+        return MathX.mulDiv(p.sizeUsd, idx - p.entryReservingRate, WAD);
+    }
+
+    function _borrowFeeTokens(Market storage m, Position storage p, uint256 price, uint256 scale)
         internal
         view
         returns (uint256)
     {
-        if (accRate <= p.entryReservingRate || p.reservedAmount == 0) return 0;
-        return MathX.mulDiv(p.reservedAmount, accRate - p.entryReservingRate, WAD);
+        return _toToken(_borrowFeeUsd(m, p), price, scale);
+    }
+
+    /// @notice Linear utilization rate. At full pool value the rate is `borrowingFactorPerSecond`.
+    /// Only the strictly heavier open-interest side accrues.
+    function _projectedBorrowRate(Market storage m, bool isLong) internal view returns (uint256) {
+        uint256 current = _book(m, isLong).accBorrowRate;
+        uint256 elapsed = block.timestamp - m.longBook.lastUpdate;
+        if (elapsed == 0 || m.config.borrowingFactorPerSecondWad == 0) return current;
+        bool heavy = isLong ? m.longOiUsd > m.shortOiUsd : m.shortOiUsd > m.longOiUsd;
+        if (!heavy) return current;
+        uint256 oi = isLong ? m.longOiUsd : m.shortOiUsd;
+        uint256 poolUsd = _poolVaultsUsd(m.poolId);
+        if (poolUsd == 0 || oi == 0) return current;
+        uint256 usage = MathX.min(MathX.mulDiv(oi, WAD, poolUsd), WAD);
+        return current + MathX.mulDiv(m.config.borrowingFactorPerSecondWad, usage, WAD) * elapsed;
+    }
+
+    function _unpaidBorrowUsd(Market storage m, bool isLong) internal view returns (uint256) {
+        uint256 oi = isLong ? m.longOiUsd : m.shortOiUsd;
+        uint256 accrued = oi * _projectedBorrowRate(m, isLong);
+        uint256 sum = _book(m, isLong).borrowEntrySum;
+        if (accrued <= sum) return 0;
+        return (accrued - sum) / WAD;
+    }
+
+    function _accrueBorrow(Market storage m) internal {
+        m.longBook.accBorrowRate = _projectedBorrowRate(m, true);
+        m.shortBook.accBorrowRate = _projectedBorrowRate(m, false);
+    }
+
+    function _syncBorrow(Market storage m, Position storage p, uint256 newSize) internal {
+        SideBook storage book = _book(m, p.isLong);
+        book.borrowEntrySum -= p.sizeUsd * p.entryReservingRate;
+        p.entryReservingRate = book.accBorrowRate;
+        if (newSize != 0) book.borrowEntrySum += newSize * book.accBorrowRate;
     }
 
     function _projectVault(TokenVault storage vault)
@@ -630,18 +672,6 @@ abstract contract PerpStore is Ownable2Step {
     {
         accRate = vault.accReservingRate;
         unrealised = vault.unrealisedReservingFee;
-        uint256 elapsed = block.timestamp - vault.lastReservingTime;
-        supplyTokens = vault.liquidity + vault.reserved + unrealised / WAD;
-        if (
-            elapsed == 0 || vault.reservingMultiplierWad == 0 || vault.reserved == 0
-                || supplyTokens == 0
-        ) return (accRate, unrealised, supplyTokens);
-        uint256 utilization = MathX.mulDiv(vault.reserved, WAD, supplyTokens);
-        uint256 delta = MathX.mulDiv(
-            MathX.mulDiv(vault.reservingMultiplierWad, utilization, WAD), elapsed, EIGHT_HOURS
-        );
-        accRate += delta;
-        unrealised += vault.reserved * delta;
         supplyTokens = vault.liquidity + vault.reserved + unrealised / WAD;
     }
 
@@ -650,12 +680,6 @@ abstract contract PerpStore is Ownable2Step {
         vault.accReservingRate = accRate;
         vault.unrealisedReservingFee = unrealised;
         vault.lastReservingTime = uint64(block.timestamp);
-    }
-
-    function _applyReservingCharge(TokenVault storage vault, uint256 feeTokens) internal {
-        uint256 feeWad = feeTokens * WAD;
-        if (feeWad > vault.unrealisedReservingFee) feeWad = vault.unrealisedReservingFee;
-        vault.unrealisedReservingFee -= feeWad;
     }
 
     function _projectFunding(Market storage m)
@@ -674,19 +698,11 @@ abstract contract PerpStore is Ownable2Step {
         longFee = m.longBook.unrealisedFundingUsd;
         shortFee = m.shortBook.unrealisedFundingUsd;
         uint256 elapsed = block.timestamp - m.longBook.lastUpdate;
-        if (elapsed == 0 || m.fundingMode == 0 || m.fundingMultiplierWad == 0) {
+        if (elapsed == 0 || m.fundingMode != 1 || m.fundingMultiplierWad == 0) {
             return (longRate, shortRate, 0, longFee, shortFee);
         }
-        int256 signed;
-        if (m.fundingMode == 1) {
-            signed = _oiRate(m);
-        } else {
-            signed = _lpPnlRate(m, true);
-        }
-        longDelta = signed * int256(elapsed) / int256(EIGHT_HOURS);
-        int256 shortDelta = m.fundingMode == 1
-            ? -longDelta
-            : _lpPnlRate(m, false) * int256(elapsed) / int256(EIGHT_HOURS);
+        longDelta = _oiRate(m) * int256(elapsed) / int256(EIGHT_HOURS);
+        int256 shortDelta = -longDelta;
         longRate += longDelta;
         shortRate += shortDelta;
         longFee += _signedMul(m.longOiUsd, longDelta);
@@ -707,24 +723,8 @@ abstract contract PerpStore is Ownable2Step {
         return normLong > normShort ? int256(rate) : -int256(rate);
     }
 
-    function _lpPnlRate(Market storage m, bool isLong) internal view returns (int256) {
-        uint256 supply = MarketPoolToken(pools[m.poolId].vault).totalSupply();
-        if (supply == 0) return 0;
-        uint32 age = m.config.maxClosePriceAge;
-        PriceData memory ip = oracle.getPrice(m.assetId, age);
-        int256 openPnl = isLong
-            ? int256(m.longOiUsd) - int256(MathX.mulDiv(m.longSizeTokens, ip.maxPrice, WAD))
-            : int256(MathX.mulDiv(m.shortSizeTokens, ip.minPrice, WAD)) - int256(m.shortOiUsd);
-        SideBook storage book = _book(m, isLong);
-        int256 pnl = book.realisedPnlUsd + book.unrealisedFundingUsd + openPnl;
-        if (pnl == 0) return 0;
-        uint256 perLp = MathX.abs(pnl) * WAD / supply;
-        uint256 rate = MathX.mulDiv(m.fundingMultiplierWad, perLp, WAD);
-        if (rate > m.fundingMaxRateWad) rate = m.fundingMaxRateWad;
-        return pnl > 0 ? -int256(rate) : int256(rate);
-    }
-
     function _accrueFunding(Market storage m) internal {
+        _accrueBorrow(m);
         (int256 longRate, int256 shortRate,, int256 longFee, int256 shortFee) = _projectFunding(m);
         m.longBook.accFundingRate = longRate;
         m.shortBook.accFundingRate = shortRate;

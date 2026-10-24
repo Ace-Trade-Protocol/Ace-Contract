@@ -12,8 +12,8 @@ contract PoolLogic is PerpStore {
     using SafeTransferLib for address;
     constructor() PerpStore(address(1)) { }
 
-    /// @notice `mode` 0 is off, 1 is open-interest skew, 2 is LP PnL including open mark-to-market.
-    /// Rates are per eight hours. Exponent applies to mode 1 and is 1, 2, or 3.
+    /// @notice `mode` 0 is off, 1 charges the heavier open-interest side. Rates are per eight hours.
+    /// The exponent is 1, 2, or 3.
     function setFundingConfig(
         uint32 id,
         uint8 mode,
@@ -21,7 +21,7 @@ contract PoolLogic is PerpStore {
         uint64 maxRateWad,
         uint8 exponent
     ) external onlyOperator {
-        if (mode > 2 || exponent < 1 || exponent > 3 || maxRateWad > 0.01e18) {
+        if (mode > 1 || exponent < 1 || exponent > 3 || maxRateWad > 0.01e18) {
             revert InvalidConfig();
         }
         if (multiplierWad > 0.1e18) revert InvalidConfig();
@@ -32,18 +32,6 @@ contract PoolLogic is PerpStore {
         m.fundingMaxRateWad = maxRateWad;
         m.fundingExponent = exponent;
         emit FundingConfigUpdated(id, mode, multiplierWad, maxRateWad, exponent);
-    }
-
-    function setReservingFee(uint32 poolId, address token, uint64 multiplierWad)
-        external
-        onlyOperator
-    {
-        if (multiplierWad > 0.1e18) revert InvalidConfig();
-        _liquidityPool(poolId);
-        TokenVault storage vault = _tokenVault(poolId, token);
-        _accrueVault(vault);
-        vault.reservingMultiplierWad = multiplierWad;
-        emit ReservingFeeUpdated(poolId, token, multiplierWad);
     }
 
     /// @notice `maxLiquidity` of zero means the vault has no ceiling.
@@ -259,16 +247,20 @@ contract PoolLogic is PerpStore {
         return first > second ? first : second;
     }
 
-    /// @notice LP value is every vault's cash, escrow, and unpaid reserving fee, plus unpaid funding.
+    /// @notice LP value is vault cash, escrow, unpaid funding, and the LP share of unpaid borrow.
     /// Trader margin and open mark-to-market are not included.
     function poolNavUsd(uint32 poolId) public view returns (uint256) {
         _liquidityPool(poolId);
         int256 nav = int256(_poolVaultsUsd(poolId));
+        uint256 lpBps =
+            BPS - uint256(feeConfig.treasuryBps) - feeConfig.insuranceBps - feeConfig.keeperBps;
         uint256 count = poolMarketIds[poolId].length;
         for (uint256 i; i < count; ++i) {
             Market storage m = markets[poolMarketIds[poolId][i]];
             (,,, int256 longFee, int256 shortFee) = _projectFunding(m);
             nav += longFee + shortFee;
+            uint256 borrowUsd = _unpaidBorrowUsd(m, true) + _unpaidBorrowUsd(m, false);
+            nav += int256(MathX.mulDiv(borrowUsd, lpBps, BPS));
         }
         return nav > 0 ? uint256(nav) : 0;
     }

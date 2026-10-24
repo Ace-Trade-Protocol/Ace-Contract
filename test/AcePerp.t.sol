@@ -156,19 +156,9 @@ contract AcePerpTest is TestBase {
         assertEq(afterPrice, beforePrice);
     }
 
-    function testLpPnlFundingChargesTheWinningSide() external {
+    function testFundingModeTwoIsRejected() external {
+        vm.expectRevert(PerpStore.InvalidConfig.selector);
         core.setFundingConfig(marketId, 2, 0.1e18, 0.01e18, 1);
-        uint256 id = _open();
-        indexOracle.setPrice(2_200e18, block.timestamp);
-        collateralOracle.setPrice(1e18, block.timestamp);
-        (int256 markedEquity,) = core.positionEquityUsd(id);
-        uint256 beforeNav = core.poolNavUsd(poolId);
-        vm.warp(block.timestamp + 1 days);
-        (int256 afterEquity,) = core.positionEquityUsd(id);
-        uint256 afterNav = core.poolNavUsd(poolId);
-        assertTrue(afterEquity < markedEquity);
-        assertTrue(afterNav > beforeNav);
-        assertTrue(afterNav - beforeNav < 100e18);
     }
 
     function testWithdrawCannotSpendAnotherVault() external {
@@ -206,16 +196,21 @@ contract AcePerpTest is TestBase {
         assertTrue(liquidityAfter + 2_000e6 > liquidityBefore);
     }
 
-    function testBorrowingAccrualIncreasesPoolNavAndReducesEquity() external {
-        core.setReservingFee(poolId, address(token), 0.05e18);
-        uint256 id = _open();
-        (int256 beforeEquity,) = core.positionEquityUsd(id);
+    function testBorrowFeeChargesOnlyTheHeavierSide() external {
+        PerpStore.MarketConfig memory config = _marketConfig();
+        config.borrowingFactorPerSecondWad = 1e12;
+        core.setMarketConfig(marketId, config);
+        uint256 longId = _open();
+        uint256 shortId = _marketOpen(marketId, address(token), 2_000e6, 2_000e18, false, 1_900e18);
+        (int256 longBefore,) = core.positionEquityUsd(longId);
+        (int256 shortBefore,) = core.positionEquityUsd(shortId);
         uint256 beforeNav = core.poolNavUsd(poolId);
         vm.warp(block.timestamp + 1 days);
-        (int256 afterEquity,) = core.positionEquityUsd(id);
-        uint256 afterNav = core.poolNavUsd(poolId);
-        assertTrue(afterEquity < beforeEquity);
-        assertTrue(afterNav > beforeNav);
+        (int256 longAfter,) = core.positionEquityUsd(longId);
+        (int256 shortAfter,) = core.positionEquityUsd(shortId);
+        assertTrue(longAfter < longBefore);
+        assertEq(shortAfter, shortBefore);
+        assertTrue(core.poolNavUsd(poolId) > beforeNav);
     }
 
     function testIncreaseAndCollateralLifecycle() external {
