@@ -8,6 +8,8 @@ import { PoolLogic } from "../src/PoolLogic.sol";
 import { TradeLogic } from "../src/TradeLogic.sol";
 import { AceOrderManager } from "../src/AceOrderManager.sol";
 import { MarketPoolToken } from "../src/market/MarketPoolToken.sol";
+import { Ownable2Step } from "../src/access/Ownable2Step.sol";
+import { AdminPriceAdapter } from "../src/oracles/AdminPriceAdapter.sol";
 import { OracleRouter } from "../src/oracles/OracleRouter.sol";
 import { PriceImpactModel } from "../src/libraries/PriceImpactModel.sol";
 import { MockERC20 } from "./mocks/MockERC20.sol";
@@ -122,6 +124,17 @@ contract AcePerpTest is TestBase {
             manager.decreasePosition(id, size, acceptable, uint64(block.timestamp + 1 days));
         AceOrderManager.OracleUpdate[] memory updates = new AceOrderManager.OracleUpdate[](0);
         manager.executeOrder(orderId, updates);
+    }
+
+    function _swap(uint32 pool, address tokenIn, address tokenOut, uint256 amountIn, uint256 minOut)
+        private
+        returns (uint256 amountOut)
+    {
+        MockERC20(tokenIn).approve(address(orders), type(uint256).max);
+        uint256 id = orders.createSwap(
+            pool, tokenIn, tokenOut, amountIn, minOut, uint64(block.timestamp + 1 days)
+        );
+        amountOut = orders.executeSwap(id);
     }
 
     function testSharedVaultHoldsBothDirections() external {
@@ -441,7 +454,7 @@ contract AcePerpTest is TestBase {
         core.depositLiquidity(shared, address(usdg), 20_000e6, 0);
         address vault = core.getPoolVault(shared);
         uint256 supply = MarketPoolToken(vault).totalSupply();
-        uint256 out = core.swap(shared, address(token), address(usdg), 1_000e6, 900e6);
+        uint256 out = _swap(shared, address(token), address(usdg), 1_000e6, 900e6);
         assertTrue(out >= 900e6);
         assertEq(MarketPoolToken(vault).totalSupply(), supply);
         assertEq(token.balanceOf(vault), 11_000e6);
@@ -505,50 +518,72 @@ contract AcePerpTest is TestBase {
         uint32 shared = core.createPool(assets, 7 days);
         usdg.mint(address(this), 10_000e6);
         usdg.approve(address(core), type(uint256).max);
+        usdg.approve(address(orders), type(uint256).max);
         core.depositLiquidity(shared, address(token), 8_000e6, 0);
         core.depositLiquidity(shared, address(usdg), 2_000e6, 0);
+        uint256 blocked = orders.createSwap(
+            shared, address(usdg), address(token), 100e6, 0, uint64(block.timestamp + 1 days)
+        );
         vm.expectRevert();
-        core.swap(shared, address(usdg), address(token), 100e6, 0);
+        orders.executeSwap(blocked);
         core.migrate(2, type(uint256).max);
         assertTrue(core.version() == 2);
-        assertTrue(core.swap(shared, address(usdg), address(token), 100e6, 0) > 0);
+        assertTrue(orders.executeSwap(blocked) > 0);
     }
 
-    function testOnlyKeeperCanSwapTowardTarget() external {
+    function testKeeperFillsTraderSwapTowardTarget() external {
         bytes32 usdgId = bytes32("USDG");
+        MockPriceAdapter usdgOracle = new MockPriceAdapter(1e18, block.timestamp);
         MockERC20 usdg = new MockERC20("Global Dollar", "USDG", 6);
-        router.setAssetConfig(
-            usdgId, _oracle(address(new MockPriceAdapter(1e18, block.timestamp)), false)
-        );
+        router.setAssetConfig(usdgId, _oracle(address(usdgOracle), false));
         PerpStore.CollateralAsset[] memory assets = new PerpStore.CollateralAsset[](2);
         assets[0] = PerpStore.CollateralAsset({ token: address(token), assetId: USDC });
         assets[1] = PerpStore.CollateralAsset({ token: address(usdg), assetId: usdgId });
         uint32 shared = core.createPool(assets, 7 days);
         usdg.mint(address(this), 50_000e6);
         usdg.mint(trader, 1_000e6);
-        usdg.approve(address(core), type(uint256).max);
-        vm.prank(trader);
+        token.mint(trader, 5_000e6);
         usdg.approve(address(core), type(uint256).max);
         core.depositLiquidity(shared, address(token), 10_000e6, 0);
         core.depositLiquidity(shared, address(usdg), 30_000e6, 0);
-        vm.expectRevert(PerpStore.NotRebalanceKeeper.selector);
-        vm.prank(trader);
-        core.swap(shared, address(token), address(usdg), 1_000e6, 0);
-        vm.expectRevert(PerpStore.ImbalanceWorsened.selector);
-        core.swap(shared, address(usdg), address(token), 1_000e6, 0);
+        vm.expectRevert(PerpStore.UnauthorizedCaller.selector);
+        core.swap(shared, address(token), address(usdg), 1_000e6, 0, trader, block.timestamp);
 
-        core.setInventoryPremium(0.05e18);
-        address keeper = address(0xA11CE);
-        core.setRebalanceKeeper(keeper, true);
-        usdg.mint(keeper, 5_000e6);
-        vm.startPrank(keeper);
-        token.approve(address(core), type(uint256).max);
-        usdg.approve(address(core), type(uint256).max);
-        token.mint(keeper, 5_000e6);
-        uint256 out = core.swap(shared, address(token), address(usdg), 1_000e6, 1_000e6);
+        vm.startPrank(trader);
+        usdg.approve(address(orders), type(uint256).max);
+        uint256 worse = orders.createSwap(
+            shared, address(usdg), address(token), 1_000e6, 0, uint64(block.timestamp + 1 days)
+        );
         vm.stopPrank();
+        address keeper = address(0xA11CE);
+        orders.addKeeper(keeper);
+        vm.expectRevert(AceOrderManager.UnauthorizedCaller.selector);
+        orders.executeSwap(worse);
+        vm.prank(keeper);
+        vm.expectRevert(PerpStore.ImbalanceWorsened.selector);
+        orders.executeSwap(worse);
+
+        vm.warp(block.timestamp + 1);
+        vm.prank(trader);
+        uint256 good = orders.createSwap(
+            shared,
+            address(token),
+            address(usdg),
+            1_000e6,
+            1_000e6,
+            uint64(block.timestamp + 1 days)
+        );
+        vm.prank(keeper);
+        vm.expectRevert(OracleRouter.PricePredatesOrder.selector);
+        orders.executeSwap(good);
+        collateralOracle.setPrice(1e18, block.timestamp);
+        usdgOracle.setPrice(1e18, block.timestamp);
+        core.setInventoryPremium(0.05e18);
+        vm.prank(keeper);
+        uint256 out = orders.executeSwap(good);
         assertTrue(out > 1_000e6);
         assertTrue(out < 1_100e6);
+        assertEq(usdg.balanceOf(trader), out);
     }
 
     function testInventoryPremiumStopsAtTheTarget() external {
@@ -566,16 +601,41 @@ contract AcePerpTest is TestBase {
         core.depositLiquidity(shared, address(token), 10_000e6, 0);
         core.depositLiquidity(shared, address(usdg), 30_000e6, 0);
         core.setInventoryPremium(0.05e18);
-        address keeper = address(0xA11CE);
-        core.setRebalanceKeeper(keeper, true);
-        token.mint(keeper, 10_000e6);
-        vm.startPrank(keeper);
-        token.approve(address(core), type(uint256).max);
-        uint256 out = core.swap(shared, address(token), address(usdg), 10_000e6, 0);
-        vm.stopPrank();
+        token.mint(address(this), 10_000e6);
+        uint256 out = _swap(shared, address(token), address(usdg), 10_000e6, 0);
         address vault = core.getPoolVault(shared);
         assertTrue(out <= 10_000e6);
         assertTrue(usdg.balanceOf(vault) >= token.balanceOf(vault));
+    }
+
+    function testRolesStaySeparate() external {
+        address operator = address(0x0B0);
+        address publisher = address(0xB0B);
+        address keeper = address(0xA11CE);
+        core.setOperator(operator);
+        vm.prank(operator);
+        core.setWeightBand(100);
+        assertEq(uint256(core.weightBandBps()), 100);
+        vm.prank(operator);
+        vm.expectRevert(Ownable2Step.Unauthorized.selector);
+        core.setGuardian(operator);
+        vm.prank(keeper);
+        vm.expectRevert(PerpStore.UnauthorizedCaller.selector);
+        core.setWeightBand(200);
+
+        AdminPriceAdapter feed = new AdminPriceAdapter(address(this), 1e18);
+        vm.prank(publisher);
+        vm.expectRevert(Ownable2Step.Unauthorized.selector);
+        feed.setBidAsk(1e18, 1e18, true);
+        feed.setPublisher(publisher);
+        vm.expectRevert(Ownable2Step.Unauthorized.selector);
+        feed.setBidAsk(1e18, 1e18, true);
+        vm.prank(publisher);
+        feed.setBidAsk(2e18, 2e18, true);
+        assertEq(feed.maxPrice(), 2e18);
+        vm.prank(publisher);
+        vm.expectRevert(Ownable2Step.Unauthorized.selector);
+        orders.addKeeper(publisher);
     }
 
     function testSplitDepositDoesNotCheapenTheWeightFee() external {

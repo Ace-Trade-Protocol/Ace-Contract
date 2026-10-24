@@ -77,7 +77,7 @@ contract OracleRouter is Ownable2Step {
     }
 
     /// @notice Same acceptance rules as `getPriceForAction`, without the market-hours revert.
-    /// Closes, liquidations, withdrawals, and keeper rebalances use the last print.
+    /// Closes, liquidations, withdrawals, and swap orders use the last print.
     function getPriceAllowingClosed(bytes32 assetId, uint256 maxAge, uint256 submittedAt)
         external
         returns (PriceData memory data)

@@ -47,6 +47,12 @@ contract AcePerp is PerpStore {
         orderManager = value;
     }
 
+    /// @notice Parameter changes. Admin retains the same authority.
+    function setOperator(address value) external onlyOwner {
+        operator = value;
+        emit OperatorUpdated(value);
+    }
+
     function setFeeDestinations(
         address treasury_,
         address insurance_,
@@ -64,7 +70,7 @@ contract AcePerp is PerpStore {
         emit FeeDestinationsUpdated(treasury_, insurance_, keeper_, config);
     }
 
-    function setTargetWeights(uint32 poolId, uint16[] calldata weightsBps) external onlyOwner {
+    function setTargetWeights(uint32 poolId, uint16[] calldata weightsBps) external onlyOperator {
         Pool storage pool = _liquidityPool(poolId);
         if (weightsBps.length != pool.assetCount) revert InvalidConfig();
         uint256 total;
@@ -77,7 +83,7 @@ contract AcePerp is PerpStore {
     }
 
     /// @notice Sets the away-from-target rebase multiplier and a linear exponent. Base stays as set.
-    function setImbalanceFee(uint64 feeWad) external onlyOwner {
+    function setImbalanceFee(uint64 feeWad) external onlyOperator {
         if (feeWad > 0.1e18) revert InvalidConfig();
         rebaseMultiplierWad = feeWad;
         rebaseExponent = 1;
@@ -85,7 +91,10 @@ contract AcePerp is PerpStore {
         emit RebaseFeeUpdated(rebaseBaseWad, feeWad, 1);
     }
 
-    function setRebaseFee(uint64 baseWad, uint64 multiplierWad, uint8 exponent) external onlyOwner {
+    function setRebaseFee(uint64 baseWad, uint64 multiplierWad, uint8 exponent)
+        external
+        onlyOperator
+    {
         if (baseWad > 0.1e18 || multiplierWad > 0.1e18 || exponent < 1 || exponent > 3) {
             revert InvalidConfig();
         }
@@ -95,21 +104,15 @@ contract AcePerp is PerpStore {
         emit RebaseFeeUpdated(baseWad, multiplierWad, exponent);
     }
 
-    function setRebalanceKeeper(address keeper, bool allowed) external onlyOwner {
-        if (keeper == address(0)) revert InvalidConfig();
-        rebalanceKeeper[keeper] = allowed;
-        emit RebalanceKeeperUpdated(keeper, allowed);
-    }
-
-    /// @notice Maximum extra output, in wad, when a keeper removes the overweight asset.
-    function setInventoryPremium(uint64 premiumWad) external onlyOwner {
+    /// @notice Maximum extra output, in wad, when a swap removes the overweight asset.
+    function setInventoryPremium(uint64 premiumWad) external onlyOperator {
         if (premiumWad > 0.05e18) revert InvalidConfig();
         inventoryPremiumWad = premiumWad;
         emit InventoryPremiumUpdated(premiumWad);
     }
 
     /// @notice Reject LP deposits and withdrawals that push a vault further outside this band.
-    function setWeightBand(uint16 bandBps) external onlyOwner {
+    function setWeightBand(uint16 bandBps) external onlyOperator {
         if (bandBps > 5_000) revert InvalidConfig();
         weightBandBps = bandBps;
         emit WeightBandUpdated(bandBps);
@@ -207,7 +210,7 @@ contract AcePerp is PerpStore {
         emit MarketCreated(id, poolId, assetId);
     }
 
-    function setMarketConfig(uint32 id, MarketConfig calldata config) external onlyOwner {
+    function setMarketConfig(uint32 id, MarketConfig calldata config) external onlyOperator {
         Market storage m = _market(id);
         _validateConfig(m.assetId, config);
         m.config = config;
@@ -215,14 +218,17 @@ contract AcePerp is PerpStore {
 
     function setPriceImpactConfig(uint32 id, PriceImpactModel.Config calldata impact)
         external
-        onlyOwner
+        onlyOperator
     {
         Market storage m = _market(id);
         PriceImpactModel.validate(impact);
         m.priceImpact = impact;
     }
 
-    function setMarketEnabled(uint32 id, bool value) external onlyGuardian {
+    function setMarketEnabled(uint32 id, bool value) external {
+        if (msg.sender != guardian && msg.sender != owner && msg.sender != operator) {
+            revert UnauthorizedCaller();
+        }
         _market(id).enabled = value;
     }
 
@@ -262,7 +268,10 @@ contract AcePerp is PerpStore {
         amount = abi.decode(data, (uint256));
     }
 
-    function swap(uint32, address, address, uint256, uint256) external returns (uint256 amountOut) {
+    function swap(uint32, address, address, uint256, uint256, address, uint256)
+        external
+        returns (uint256 amountOut)
+    {
         bytes memory data = _delegate(poolLogic);
         amountOut = abi.decode(data, (uint256));
     }

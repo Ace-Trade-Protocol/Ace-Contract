@@ -144,13 +144,13 @@ abstract contract PerpStore is Ownable2Step {
     error MarketClosed();
     error FunctionDisabled(uint8 id);
     error VersionMismatch();
-    error NotRebalanceKeeper();
     error ImbalanceWorsened();
     error WeightBand();
 
     OracleRouter internal oracle;
     MarketPoolFactory internal poolFactory;
     address public guardian;
+    address public operator;
     address public orderManager;
     address public treasury;
     address public insuranceFund;
@@ -160,11 +160,10 @@ abstract contract PerpStore is Ownable2Step {
     uint64 public rebaseBaseWad;
     uint64 public rebaseMultiplierWad;
     uint8 public rebaseExponent = 1;
-    /// @notice Extra heavy-asset output for a keeper swap that restores target weight. Capped at 5%.
+    /// @notice Extra heavy-asset output for a swap that restores target weight. Capped at 5%.
     uint64 public inventoryPremiumWad;
     /// @notice LP actions that increase deviation past this distance from target revert. Zero disables it.
     uint16 public weightBandBps;
-    mapping(address => bool) public rebalanceKeeper;
     address public lossProtection;
     uint16 public lossCutBps;
     uint16 public winFundBps;
@@ -225,7 +224,7 @@ abstract contract PerpStore is Ownable2Step {
     event TargetWeightsUpdated(uint32 indexed poolId);
     event ImbalanceFeeUpdated(uint64 feeWad);
     event RebaseFeeUpdated(uint64 baseWad, uint64 multiplierWad, uint8 exponent);
-    event RebalanceKeeperUpdated(address indexed keeper, bool allowed);
+    event OperatorUpdated(address indexed operator);
     event InventoryPremiumUpdated(uint64 premiumWad);
     event WeightBandUpdated(uint16 bandBps);
     event ReservingFeeUpdated(uint32 indexed poolId, address indexed token, uint64 multiplierWad);
@@ -267,6 +266,12 @@ abstract contract PerpStore is Ownable2Step {
 
     modifier onlyGuardian() {
         if (msg.sender != guardian && msg.sender != owner) revert UnauthorizedCaller();
+        _;
+    }
+
+    /// @notice Admin keeps this authority. Operator is an additional address for parameter changes.
+    modifier onlyOperator() {
+        if (msg.sender != owner && msg.sender != operator) revert UnauthorizedCaller();
         _;
     }
 

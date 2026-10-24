@@ -55,6 +55,8 @@ contract AceOrderManager is Ownable2Step {
     uint256 public nextOrderId = 1;
     uint256 private entered = 1;
     mapping(uint256 => Order) public orders;
+    uint256 public nextSwapId = 1;
+    mapping(uint256 => SwapOrder) public swapOrders;
     address[] public keepers;
     mapping(address => uint256) private keeperIndex;
     event OrderCreated(
@@ -62,6 +64,21 @@ contract AceOrderManager is Ownable2Step {
     );
     event OrderCancelled(uint256 indexed id);
     event OrderExecuted(uint256 indexed id, address indexed keeper, uint256 positionId);
+    event SwapOrderCreated(uint256 indexed id, address indexed owner, uint32 indexed poolId);
+    event SwapOrderCancelled(uint256 indexed id);
+    event SwapOrderExecuted(uint256 indexed id, address indexed keeper, uint256 amountOut);
+
+    struct SwapOrder {
+        address owner;
+        uint32 poolId;
+        address tokenIn;
+        address tokenOut;
+        uint256 amountIn;
+        uint256 minOut;
+        uint64 submittedAt;
+        uint64 expiresAt;
+        uint128 executionFee;
+    }
 
     constructor(address initialOwner, address core_, uint256 minFee) Ownable2Step(initialOwner) {
         if (core_.code.length == 0) revert InvalidOrder();
@@ -76,7 +93,8 @@ contract AceOrderManager is Ownable2Step {
         entered = 1;
     }
 
-    function setMinExecutionFee(uint256 value) external onlyOwner {
+    function setMinExecutionFee(uint256 value) external {
+        if (msg.sender != owner && msg.sender != core.operator()) revert UnauthorizedCaller();
         minExecutionFee = value;
     }
 
@@ -265,6 +283,71 @@ contract AceOrderManager is Ownable2Step {
         }
         _sendNative(msg.sender, o.executionFee);
         emit OrderExecuted(id, msg.sender, positionId);
+    }
+
+    /// @notice Escrows `tokenIn`. A keeper fills the swap on the trader's behalf.
+    function createSwap(
+        uint32 poolId,
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn,
+        uint256 minOut,
+        uint64 expiresAt
+    ) external payable nonReentrant returns (uint256 id) {
+        if (
+            msg.value < minExecutionFee || msg.value > type(uint128).max || amountIn == 0
+                || tokenIn == tokenOut || tokenIn == address(0) || tokenOut == address(0)
+                || expiresAt <= block.timestamp
+        ) revert InvalidOrder();
+        tokenIn.safeTransferFrom(msg.sender, address(this), amountIn);
+        id = nextSwapId++;
+        swapOrders[id] = SwapOrder(
+            msg.sender,
+            poolId,
+            tokenIn,
+            tokenOut,
+            amountIn,
+            minOut,
+            uint64(block.timestamp),
+            expiresAt,
+            uint128(msg.value)
+        );
+        emit SwapOrderCreated(id, msg.sender, poolId);
+    }
+
+    function cancelSwap(uint256 id) external nonReentrant {
+        SwapOrder memory o = swapOrders[id];
+        if (o.owner == address(0)) revert InvalidOrder();
+        if (msg.sender != o.owner) revert UnauthorizedCaller();
+        delete swapOrders[id];
+        o.tokenIn.safeTransfer(o.owner, o.amountIn);
+        _sendNative(o.owner, o.executionFee);
+        emit SwapOrderCancelled(id);
+    }
+
+    function cancelExpiredSwap(uint256 id) external nonReentrant {
+        SwapOrder memory o = swapOrders[id];
+        if (o.owner == address(0)) revert InvalidOrder();
+        if (block.timestamp <= o.expiresAt) revert InvalidOrder();
+        delete swapOrders[id];
+        o.tokenIn.safeTransfer(o.owner, o.amountIn);
+        _sendNative(msg.sender, o.executionFee);
+        emit SwapOrderCancelled(id);
+    }
+
+    function executeSwap(uint256 id) external nonReentrant returns (uint256 amountOut) {
+        _authorizedKeeper();
+        SwapOrder memory o = swapOrders[id];
+        if (o.owner == address(0)) revert InvalidOrder();
+        if (block.timestamp > o.expiresAt) revert OrderExpired();
+        delete swapOrders[id];
+        IERC20(o.tokenIn).approve(address(core), 0);
+        IERC20(o.tokenIn).approve(address(core), o.amountIn);
+        amountOut = core.swap(
+            o.poolId, o.tokenIn, o.tokenOut, o.amountIn, o.minOut, o.owner, o.submittedAt
+        );
+        _sendNative(msg.sender, o.executionFee);
+        emit SwapOrderExecuted(id, msg.sender, amountOut);
     }
 
     function _create(
