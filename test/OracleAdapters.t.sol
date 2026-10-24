@@ -110,8 +110,9 @@ contract OracleAdaptersTest is TestBase {
     }
 
     function testChainlinkNormalizes() external {
-        ChainlinkAdapter a =
-            new ChainlinkAdapter(address(new MockChainlink()), address(0), 0, address(0), true);
+        ChainlinkAdapter a = new ChainlinkAdapter(
+            address(new MockChainlink()), address(0), 0, address(0), true, 0, 0, 0
+        );
         PriceData memory p = a.getPrice(60);
         assertEq(p.minPrice, 2_000e18);
         assertTrue(p.marketOpen);
@@ -168,8 +169,25 @@ contract OracleAdaptersTest is TestBase {
         MockChainlink sequencer = new MockChainlink();
         sequencer.set(1, block.timestamp - 1 hours);
         ChainlinkAdapter a =
-            new ChainlinkAdapter(address(feed), address(sequencer), 60, address(0), true);
+            new ChainlinkAdapter(address(feed), address(sequencer), 60, address(0), true, 0, 0, 0);
         vm.expectRevert();
         a.getPrice(60);
+    }
+
+    function testEquitySessionClosesOutsideCashHours() external {
+        MockChainlink feed = new MockChainlink();
+        ChainlinkAdapter a = new ChainlinkAdapter(
+            address(feed), address(0), 0, address(0), false, 810, 1_260, 1 days
+        );
+        uint256 monday = 1_793_026_800;
+        vm.warp(monday);
+        feed.set(2_000e8, monday);
+        assertTrue(a.getPrice(4 days).marketOpen);
+        vm.warp(monday - 2 days);
+        feed.set(2_000e8, monday - 2 days);
+        assertTrue(!a.getPrice(4 days).marketOpen);
+        vm.warp(monday);
+        feed.set(2_000e8, monday - 2 days);
+        assertTrue(!a.getPrice(4 days).marketOpen);
     }
 }

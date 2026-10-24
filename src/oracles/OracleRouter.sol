@@ -73,10 +73,28 @@ contract OracleRouter is Ownable2Step {
         external
         returns (PriceData memory data)
     {
+        return _priceForAction(assetId, maxAge, submittedAt, true);
+    }
+
+    /// @notice Same acceptance rules as `getPriceForAction`, without the market-hours revert.
+    /// Closes, liquidations, withdrawals, and keeper rebalances use the last print.
+    function getPriceAllowingClosed(bytes32 assetId, uint256 maxAge, uint256 submittedAt)
+        external
+        returns (PriceData memory data)
+    {
+        return _priceForAction(assetId, maxAge, submittedAt, false);
+    }
+
+    function _priceForAction(
+        bytes32 assetId,
+        uint256 maxAge,
+        uint256 submittedAt,
+        bool enforceSession
+    ) private returns (PriceData memory data) {
         AssetConfig memory c = configs[assetId];
         data = _read(assetId, maxAge);
         if (data.updatedAt < submittedAt) revert PricePredatesOrder();
-        if (c.requireMarketOpen && !data.marketOpen) revert MarketClosed();
+        if (enforceSession && c.requireMarketOpen && !data.marketOpen) revert MarketClosed();
         uint256 mid = (data.minPrice + data.maxPrice) / 2;
         uint256 old = lastAcceptedMid[assetId];
         if (

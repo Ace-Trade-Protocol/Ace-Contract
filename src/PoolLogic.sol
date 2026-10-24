@@ -82,6 +82,7 @@ contract PoolLogic is PerpStore {
         uint256 usd = _toUsd(amount, cp.minPrice, asset.scale);
         uint256 vaultUsd = _vaultValue(poolId, token, cp.minPrice);
         uint256 totalUsd = _poolVaultsUsd(poolId);
+        _checkWeightBand(true, vaultUsd, totalUsd, usd, asset.targetWeightBps);
         uint256 feeUsd = _rebaseFeeUsd(true, vaultUsd, totalUsd, usd, asset.targetWeightBps);
         if (feeUsd >= usd) revert SlippageExceeded();
         uint256 netUsd = usd - feeUsd;
@@ -108,12 +109,14 @@ contract PoolLogic is PerpStore {
         uint256 supply = shareToken.totalSupply();
         if (shares > shareToken.balanceOf(msg.sender)) revert InvalidAmount();
         uint256 nav = poolNavUsd(poolId);
-        PriceData memory cp = oracle.getPriceForAction(asset.assetId, pool.maxPriceAge, 0);
+        PriceData memory cp = oracle.getPriceAllowingClosed(asset.assetId, pool.maxPriceAge, 0);
         uint256 vaultUsd = _vaultValue(poolId, token, cp.minPrice);
         uint256 grossUsd = MathX.mulDiv(nav, shares, supply);
+        _checkWeightBand(false, vaultUsd, _poolVaultsUsd(poolId), grossUsd, asset.targetWeightBps);
         if (grossUsd > vaultUsd) revert ExceedsVaultValue();
-        uint256 feeUsd =
-            _rebaseFeeUsd(false, vaultUsd, _poolVaultsUsd(poolId), grossUsd, asset.targetWeightBps);
+        uint256 feeUsd = _rebaseFeeUsd(
+            false, vaultUsd, _poolVaultsUsd(poolId), grossUsd, asset.targetWeightBps
+        );
         uint256 netUsd = grossUsd > feeUsd ? grossUsd - feeUsd : 0;
         amount = _toToken(netUsd, cp.maxPrice, asset.scale);
         if (amount < minAmount) revert SlippageExceeded();
@@ -127,6 +130,8 @@ contract PoolLogic is PerpStore {
         emit LiquidityWithdrawn(msg.sender, poolId, token, amount, shares);
     }
 
+    /// @notice Keeper-only inventory swap. The pool sells the overweight asset at a discount
+    /// bounded by `inventoryPremiumWad`. A swap that increases deviation reverts.
     function swap(
         uint32 poolId,
         address tokenIn,
@@ -135,6 +140,7 @@ contract PoolLogic is PerpStore {
         uint256 minOut
     ) external nonReentrant returns (uint256 amountOut) {
         _checkFn(FN_SWAP);
+        if (msg.sender != owner && !rebalanceKeeper[msg.sender]) revert NotRebalanceKeeper();
         if (tokenIn == tokenOut || amountIn == 0) revert InvalidAmount();
         Pool storage pool = _liquidityPool(poolId);
         _accruePool(poolId);
@@ -145,8 +151,10 @@ contract PoolLogic is PerpStore {
         if (inVault.maxLiquidity != 0 && inVault.liquidity + amountIn > inVault.maxLiquidity) {
             revert InsufficientLiquidity();
         }
-        PriceData memory inPrice = oracle.getPriceForAction(incoming.assetId, pool.maxPriceAge, 0);
-        PriceData memory outPrice = oracle.getPriceForAction(outgoing.assetId, pool.maxPriceAge, 0);
+        PriceData memory inPrice =
+            oracle.getPriceAllowingClosed(incoming.assetId, pool.maxPriceAge, 0);
+        PriceData memory outPrice =
+            oracle.getPriceAllowingClosed(outgoing.assetId, pool.maxPriceAge, 0);
         uint256 totalUsd = _poolVaultsUsd(poolId);
         uint256 inUsd = _toUsd(amountIn, inPrice.minPrice, incoming.scale);
         uint256 inVaultUsd = _vaultValue(poolId, tokenIn, inPrice.minPrice);
@@ -157,10 +165,47 @@ contract PoolLogic is PerpStore {
         uint256 outFee =
             _rebaseFeeUsd(false, outVaultUsd, totalUsd, netIn, outgoing.targetWeightBps);
         uint256 netUsd = netIn > outFee ? netIn - outFee : 0;
-        amountOut = _toToken(netUsd, outPrice.maxPrice, outgoing.scale);
-        if (amountOut == 0 || amountOut < minOut || amountOut > outVault.liquidity) {
-            revert SlippageExceeded();
+        uint256 fairOut = _toToken(netUsd, outPrice.maxPrice, outgoing.scale);
+        if (fairOut == 0) revert SlippageExceeded();
+        uint256 outUsd = _toUsd(fairOut, outPrice.maxPrice, outgoing.scale);
+        uint256 rest = totalUsd > inVaultUsd + outVaultUsd ? totalUsd - inVaultUsd - outVaultUsd : 0;
+        uint256 inAfter = inVaultUsd + netIn;
+        uint256 outAfter = outVaultUsd > outUsd ? outVaultUsd - outUsd : 0;
+        uint256 totalAfter = inAfter + outAfter + rest;
+        uint256 beforeDev = _pairDeviation(
+            inVaultUsd, outVaultUsd, totalUsd, incoming.targetWeightBps, outgoing.targetWeightBps
+        );
+        uint256 afterDev = _pairDeviation(
+            inAfter, outAfter, totalAfter, incoming.targetWeightBps, outgoing.targetWeightBps
+        );
+        if (afterDev > beforeDev) revert ImbalanceWorsened();
+        amountOut = fairOut;
+        if (inventoryPremiumWad != 0 && totalUsd != 0) {
+            uint256 ratio = MathX.mulDiv(outVaultUsd, WAD, totalUsd);
+            uint256 target = MathX.mulDiv(uint256(outgoing.targetWeightBps), WAD, BPS);
+            if (ratio > target) {
+                uint256 rate = MathX.mulDiv(inventoryPremiumWad, ratio - target, 0.5e18);
+                if (rate > inventoryPremiumWad) rate = inventoryPremiumWad;
+                uint256 premiumOut = fairOut + MathX.mulDiv(fairOut, rate, WAD);
+                uint256 untilTarget = _outputUntilTarget(
+                    outVaultUsd, inAfter + rest, target, outPrice.maxPrice, outgoing.scale
+                );
+                if (premiumOut > untilTarget) premiumOut = untilTarget;
+                if (premiumOut > fairOut) {
+                    uint256 premiumUsd = _toUsd(premiumOut, outPrice.maxPrice, outgoing.scale);
+                    uint256 premiumVault = outVaultUsd > premiumUsd ? outVaultUsd - premiumUsd : 0;
+                    uint256 premiumDev = _pairDeviation(
+                        inAfter,
+                        premiumVault,
+                        inAfter + premiumVault + rest,
+                        incoming.targetWeightBps,
+                        outgoing.targetWeightBps
+                    );
+                    if (premiumDev <= beforeDev) amountOut = premiumOut;
+                }
+            }
         }
+        if (amountOut < minOut || amountOut > outVault.liquidity) revert SlippageExceeded();
         if (outVault.minLiquidity != 0 && outVault.liquidity - amountOut < outVault.minLiquidity) {
             revert InsufficientLiquidity();
         }
@@ -169,6 +214,35 @@ contract PoolLogic is PerpStore {
         outVault.liquidity -= amountOut;
         MarketPoolToken(pool.vault).transferToken(tokenOut, msg.sender, amountOut);
         emit Swapped(msg.sender, poolId, tokenIn, tokenOut, amountIn, amountOut);
+    }
+
+    /// @dev Largest token output that leaves the outgoing vault on its target weight.
+    function _outputUntilTarget(
+        uint256 outVaultUsd,
+        uint256 otherUsd,
+        uint256 targetWad,
+        uint256 price,
+        uint256 scale
+    ) private pure returns (uint256) {
+        if (targetWad >= WAD || price == 0) return 0;
+        uint256 poolUsd = otherUsd + outVaultUsd;
+        uint256 floorUsd = MathX.mulDiv(poolUsd, targetWad, WAD);
+        if (outVaultUsd <= floorUsd) return 0;
+        uint256 maxOutUsd = MathX.mulDiv(outVaultUsd - floorUsd, WAD, WAD - targetWad);
+        return _toToken(maxOutUsd, price, scale);
+    }
+
+    function _pairDeviation(
+        uint256 firstUsd,
+        uint256 secondUsd,
+        uint256 totalUsd,
+        uint16 firstTarget,
+        uint16 secondTarget
+    ) private pure returns (uint256) {
+        if (totalUsd == 0) return 0;
+        uint256 first = _deviationWad(firstUsd, totalUsd, firstTarget);
+        uint256 second = _deviationWad(secondUsd, totalUsd, secondTarget);
+        return first > second ? first : second;
     }
 
     /// @notice LP value is every vault's cash, escrow, and unpaid reserving fee, plus unpaid funding.

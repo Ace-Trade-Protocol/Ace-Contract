@@ -144,6 +144,9 @@ abstract contract PerpStore is Ownable2Step {
     error MarketClosed();
     error FunctionDisabled(uint8 id);
     error VersionMismatch();
+    error NotRebalanceKeeper();
+    error ImbalanceWorsened();
+    error WeightBand();
 
     OracleRouter internal oracle;
     MarketPoolFactory internal poolFactory;
@@ -157,6 +160,11 @@ abstract contract PerpStore is Ownable2Step {
     uint64 public rebaseBaseWad;
     uint64 public rebaseMultiplierWad;
     uint8 public rebaseExponent = 1;
+    /// @notice Extra heavy-asset output for a keeper swap that restores target weight. Capped at 5%.
+    uint64 public inventoryPremiumWad;
+    /// @notice LP actions that increase deviation past this distance from target revert. Zero disables it.
+    uint16 public weightBandBps;
+    mapping(address => bool) public rebalanceKeeper;
     address public lossProtection;
     uint16 public lossCutBps;
     uint16 public winFundBps;
@@ -217,6 +225,9 @@ abstract contract PerpStore is Ownable2Step {
     event TargetWeightsUpdated(uint32 indexed poolId);
     event ImbalanceFeeUpdated(uint64 feeWad);
     event RebaseFeeUpdated(uint64 baseWad, uint64 multiplierWad, uint8 exponent);
+    event RebalanceKeeperUpdated(address indexed keeper, bool allowed);
+    event InventoryPremiumUpdated(uint64 premiumWad);
+    event WeightBandUpdated(uint16 bandBps);
     event ReservingFeeUpdated(uint32 indexed poolId, address indexed token, uint64 multiplierWad);
     event VaultBoundsUpdated(
         uint32 indexed poolId, address indexed token, uint256 minLiquidity, uint256 maxLiquidity
@@ -458,6 +469,8 @@ abstract contract PerpStore is Ownable2Step {
                 closed = true;
                 profitTokens = p.reservedAmount;
             }
+            uint256 retain = _retainedForWeight(m.poolId, token, profitTokens, cp.maxPrice, scale);
+            profitTokens -= retain;
         } else if (rawPnl < 0) {
             lossTokens = _toTokenUp(uint256(-rawPnl), cp.minPrice, scale);
             if (lossTokens >= p.collateralAmount) {
@@ -758,20 +771,94 @@ abstract contract PerpStore is Ownable2Step {
         if (amountUsd == 0 || totalUsd == 0 || rebaseBaseWad == 0 && rebaseMultiplierWad == 0) {
             return 0;
         }
-        uint256 nextVault =
-            adding ? vaultUsd + amountUsd : (vaultUsd > amountUsd ? vaultUsd - amountUsd : 0);
-        uint256 nextTotal =
+        (uint256 nextVault, uint256 nextTotal) = _nextVault(adding, vaultUsd, totalUsd, amountUsd);
+        if (nextTotal == 0) return 0;
+        uint256 prior = _weightPotential(vaultUsd, totalUsd, weightBps);
+        uint256 later = _weightPotential(nextVault, nextTotal, weightBps);
+        uint256 drift = later > prior ? later - prior : 0;
+        return MathX.mulDiv(amountUsd, rebaseBaseWad, WAD) + drift;
+    }
+
+    /// @notice State function of one vault's distance from target. Splitting a deposit cannot
+    /// reduce the sum of these deltas.
+    function _weightPotential(uint256 vaultUsd, uint256 totalUsd, uint16 weightBps)
+        internal
+        view
+        returns (uint256)
+    {
+        if (totalUsd == 0 || rebaseMultiplierWad == 0) return 0;
+        uint256 deviation = _deviationWad(vaultUsd, totalUsd, weightBps);
+        uint8 power = rebaseExponent + 1;
+        uint256 curve = _powWad(deviation, power);
+        uint256 unit = MathX.mulDiv(rebaseMultiplierWad, curve, WAD) / power;
+        return MathX.mulDiv(totalUsd, unit, WAD);
+    }
+
+    function _checkWeightBand(
+        bool adding,
+        uint256 vaultUsd,
+        uint256 totalUsd,
+        uint256 amountUsd,
+        uint16 weightBps
+    ) internal view {
+        if (weightBandBps == 0 || amountUsd == 0 || totalUsd == 0) return;
+        (uint256 nextVault, uint256 nextTotal) = _nextVault(adding, vaultUsd, totalUsd, amountUsd);
+        if (nextTotal == 0) return;
+        uint256 prior = _deviationBps(vaultUsd, totalUsd, weightBps);
+        uint256 later = _deviationBps(nextVault, nextTotal, weightBps);
+        if (later > prior && later > weightBandBps) revert WeightBand();
+    }
+
+    function _retainedForWeight(
+        uint32 poolId,
+        address token,
+        uint256 tokensOut,
+        uint256 price,
+        uint256 scale
+    ) internal view returns (uint256 retain) {
+        if (tokensOut == 0 || rebaseMultiplierWad == 0) return 0;
+        PoolAsset storage asset = _asset(poolId, token);
+        uint256 vaultUsd = _vaultValue(poolId, token, price);
+        uint256 total = _poolVaultsUsd(poolId);
+        uint256 outUsd = _toUsd(tokensOut, price, scale);
+        if (outUsd > vaultUsd) outUsd = vaultUsd;
+        if (total <= outUsd) return 0;
+        uint256 prior = _weightPotential(vaultUsd, total, asset.targetWeightBps);
+        uint256 later = _weightPotential(vaultUsd - outUsd, total - outUsd, asset.targetWeightBps);
+        if (later <= prior) return 0;
+        retain = _toToken(later - prior, price, scale);
+        if (retain > tokensOut) retain = tokensOut;
+    }
+
+    function _nextVault(bool adding, uint256 vaultUsd, uint256 totalUsd, uint256 amountUsd)
+        internal
+        pure
+        returns (uint256 nextVault, uint256 nextTotal)
+    {
+        nextVault = adding
+            ? vaultUsd + amountUsd
+            : (vaultUsd > amountUsd ? vaultUsd - amountUsd : 0);
+        nextTotal =
             adding ? totalUsd + amountUsd : (totalUsd > amountUsd ? totalUsd - amountUsd : 0);
-        if (nextTotal == 0 || nextVault == nextTotal) return 0;
-        uint256 ratio = MathX.mulDiv(nextVault, WAD, nextTotal);
-        uint256 target = MathX.mulDiv(weightBps, WAD, BPS);
-        bool toward = adding ? ratio <= target : ratio >= target;
-        uint256 rate = rebaseBaseWad;
-        if (!toward) {
-            uint256 deviation = ratio > target ? ratio - target : target - ratio;
-            rate += MathX.mulDiv(rebaseMultiplierWad, _powWad(deviation, rebaseExponent), WAD);
-        }
-        return MathX.mulDiv(amountUsd, rate, WAD);
+    }
+
+    function _deviationWad(uint256 vaultUsd, uint256 totalUsd, uint16 weightBps)
+        internal
+        pure
+        returns (uint256)
+    {
+        if (totalUsd == 0) return 0;
+        uint256 ratio = MathX.mulDiv(vaultUsd, WAD, totalUsd);
+        uint256 target = MathX.mulDiv(uint256(weightBps), WAD, BPS);
+        return ratio > target ? ratio - target : target - ratio;
+    }
+
+    function _deviationBps(uint256 vaultUsd, uint256 totalUsd, uint16 weightBps)
+        internal
+        pure
+        returns (uint256)
+    {
+        return _deviationWad(vaultUsd, totalUsd, weightBps) / 1e14;
     }
 
     function _powWad(uint256 base, uint8 exponent) internal pure returns (uint256) {
@@ -880,10 +967,15 @@ abstract contract PerpStore is Ownable2Step {
     {
         PoolAsset storage asset = _asset(m.poolId, token);
         uint32 age = opening ? m.config.maxOpenPriceAge : m.config.maxClosePriceAge;
-        ip = oracle.getPriceForAction(m.assetId, age, submittedAt);
-        cp = oracle.getPriceForAction(asset.assetId, age, submittedAt);
+        if (opening) {
+            ip = oracle.getPriceForAction(m.assetId, age, submittedAt);
+            cp = oracle.getPriceForAction(asset.assetId, age, submittedAt);
+            if (!ip.marketOpen) revert MarketClosed();
+        } else {
+            ip = oracle.getPriceAllowingClosed(m.assetId, age, submittedAt);
+            cp = oracle.getPriceAllowingClosed(asset.assetId, age, submittedAt);
+        }
         scale = asset.scale;
-        if (!ip.marketOpen) revert MarketClosed();
     }
 
     function _slippage(uint256 price, uint256 acceptable, bool buy) internal pure {

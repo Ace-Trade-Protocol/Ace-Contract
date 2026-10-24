@@ -95,6 +95,26 @@ contract AcePerp is PerpStore {
         emit RebaseFeeUpdated(baseWad, multiplierWad, exponent);
     }
 
+    function setRebalanceKeeper(address keeper, bool allowed) external onlyOwner {
+        if (keeper == address(0)) revert InvalidConfig();
+        rebalanceKeeper[keeper] = allowed;
+        emit RebalanceKeeperUpdated(keeper, allowed);
+    }
+
+    /// @notice Maximum extra output, in wad, when a keeper removes the overweight asset.
+    function setInventoryPremium(uint64 premiumWad) external onlyOwner {
+        if (premiumWad > 0.05e18) revert InvalidConfig();
+        inventoryPremiumWad = premiumWad;
+        emit InventoryPremiumUpdated(premiumWad);
+    }
+
+    /// @notice Reject LP deposits and withdrawals that push a vault further outside this band.
+    function setWeightBand(uint16 bandBps) external onlyOwner {
+        if (bandBps > 5_000) revert InvalidConfig();
+        weightBandBps = bandBps;
+        emit WeightBandUpdated(bandBps);
+    }
+
     function setLossProtection(address vault, uint16 lossCutBps_, uint16 winFundBps_)
         external
         onlyOwner

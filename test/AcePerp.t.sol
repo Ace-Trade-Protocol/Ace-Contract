@@ -437,14 +437,14 @@ contract AcePerpTest is TestBase {
         usdg.mint(address(this), 50_000e6);
         token.mint(address(this), 50_000e6);
         usdg.approve(address(core), type(uint256).max);
-        core.depositLiquidity(shared, address(token), 20_000e6, 0);
+        core.depositLiquidity(shared, address(token), 10_000e6, 0);
         core.depositLiquidity(shared, address(usdg), 20_000e6, 0);
         address vault = core.getPoolVault(shared);
         uint256 supply = MarketPoolToken(vault).totalSupply();
         uint256 out = core.swap(shared, address(token), address(usdg), 1_000e6, 900e6);
         assertTrue(out >= 900e6);
         assertEq(MarketPoolToken(vault).totalSupply(), supply);
-        assertEq(token.balanceOf(vault), 21_000e6);
+        assertEq(token.balanceOf(vault), 11_000e6);
     }
 
     function testKeeperAllowlistRestrictsExecution() external {
@@ -505,12 +505,141 @@ contract AcePerpTest is TestBase {
         uint32 shared = core.createPool(assets, 7 days);
         usdg.mint(address(this), 10_000e6);
         usdg.approve(address(core), type(uint256).max);
-        core.depositLiquidity(shared, address(token), 5_000e6, 0);
-        core.depositLiquidity(shared, address(usdg), 5_000e6, 0);
+        core.depositLiquidity(shared, address(token), 8_000e6, 0);
+        core.depositLiquidity(shared, address(usdg), 2_000e6, 0);
         vm.expectRevert();
-        core.swap(shared, address(token), address(usdg), 100e6, 0);
+        core.swap(shared, address(usdg), address(token), 100e6, 0);
         core.migrate(2, type(uint256).max);
         assertTrue(core.version() == 2);
-        assertTrue(core.swap(shared, address(token), address(usdg), 100e6, 0) > 0);
+        assertTrue(core.swap(shared, address(usdg), address(token), 100e6, 0) > 0);
+    }
+
+    function testOnlyKeeperCanSwapTowardTarget() external {
+        bytes32 usdgId = bytes32("USDG");
+        MockERC20 usdg = new MockERC20("Global Dollar", "USDG", 6);
+        router.setAssetConfig(
+            usdgId, _oracle(address(new MockPriceAdapter(1e18, block.timestamp)), false)
+        );
+        PerpStore.CollateralAsset[] memory assets = new PerpStore.CollateralAsset[](2);
+        assets[0] = PerpStore.CollateralAsset({ token: address(token), assetId: USDC });
+        assets[1] = PerpStore.CollateralAsset({ token: address(usdg), assetId: usdgId });
+        uint32 shared = core.createPool(assets, 7 days);
+        usdg.mint(address(this), 50_000e6);
+        usdg.mint(trader, 1_000e6);
+        usdg.approve(address(core), type(uint256).max);
+        vm.prank(trader);
+        usdg.approve(address(core), type(uint256).max);
+        core.depositLiquidity(shared, address(token), 10_000e6, 0);
+        core.depositLiquidity(shared, address(usdg), 30_000e6, 0);
+        vm.expectRevert(PerpStore.NotRebalanceKeeper.selector);
+        vm.prank(trader);
+        core.swap(shared, address(token), address(usdg), 1_000e6, 0);
+        vm.expectRevert(PerpStore.ImbalanceWorsened.selector);
+        core.swap(shared, address(usdg), address(token), 1_000e6, 0);
+
+        core.setInventoryPremium(0.05e18);
+        address keeper = address(0xA11CE);
+        core.setRebalanceKeeper(keeper, true);
+        usdg.mint(keeper, 5_000e6);
+        vm.startPrank(keeper);
+        token.approve(address(core), type(uint256).max);
+        usdg.approve(address(core), type(uint256).max);
+        token.mint(keeper, 5_000e6);
+        uint256 out = core.swap(shared, address(token), address(usdg), 1_000e6, 1_000e6);
+        vm.stopPrank();
+        assertTrue(out > 1_000e6);
+        assertTrue(out < 1_100e6);
+    }
+
+    function testInventoryPremiumStopsAtTheTarget() external {
+        bytes32 usdgId = bytes32("USDG");
+        MockERC20 usdg = new MockERC20("Global Dollar", "USDG", 6);
+        router.setAssetConfig(
+            usdgId, _oracle(address(new MockPriceAdapter(1e18, block.timestamp)), false)
+        );
+        PerpStore.CollateralAsset[] memory assets = new PerpStore.CollateralAsset[](2);
+        assets[0] = PerpStore.CollateralAsset({ token: address(token), assetId: USDC });
+        assets[1] = PerpStore.CollateralAsset({ token: address(usdg), assetId: usdgId });
+        uint32 shared = core.createPool(assets, 7 days);
+        usdg.mint(address(this), 50_000e6);
+        usdg.approve(address(core), type(uint256).max);
+        core.depositLiquidity(shared, address(token), 10_000e6, 0);
+        core.depositLiquidity(shared, address(usdg), 30_000e6, 0);
+        core.setInventoryPremium(0.05e18);
+        address keeper = address(0xA11CE);
+        core.setRebalanceKeeper(keeper, true);
+        token.mint(keeper, 10_000e6);
+        vm.startPrank(keeper);
+        token.approve(address(core), type(uint256).max);
+        uint256 out = core.swap(shared, address(token), address(usdg), 10_000e6, 0);
+        vm.stopPrank();
+        address vault = core.getPoolVault(shared);
+        assertTrue(out <= 10_000e6);
+        assertTrue(usdg.balanceOf(vault) >= token.balanceOf(vault));
+    }
+
+    function testSplitDepositDoesNotCheapenTheWeightFee() external {
+        bytes32 usdgId = bytes32("USDG");
+        MockERC20 usdg = new MockERC20("Global Dollar", "USDG", 6);
+        router.setAssetConfig(
+            usdgId, _oracle(address(new MockPriceAdapter(1e18, block.timestamp)), false)
+        );
+        PerpStore.CollateralAsset[] memory assets = new PerpStore.CollateralAsset[](2);
+        assets[0] = PerpStore.CollateralAsset({ token: address(token), assetId: USDC });
+        assets[1] = PerpStore.CollateralAsset({ token: address(usdg), assetId: usdgId });
+        uint32 oncePool = core.createPool(assets, 7 days);
+        uint32 splitPool = core.createPool(assets, 7 days);
+        usdg.mint(address(this), 100_000e6);
+        usdg.approve(address(core), type(uint256).max);
+        core.setRebaseFee(0, 0.05e18, 1);
+        core.depositLiquidity(oncePool, address(token), 10_000e6, 0);
+        core.depositLiquidity(oncePool, address(usdg), 10_000e6, 0);
+        core.depositLiquidity(splitPool, address(token), 10_000e6, 0);
+        core.depositLiquidity(splitPool, address(usdg), 10_000e6, 0);
+        uint256 onceShares = core.depositLiquidity(oncePool, address(token), 6_000e6, 0);
+        uint256 splitShares = core.depositLiquidity(splitPool, address(token), 2_000e6, 0);
+        splitShares += core.depositLiquidity(splitPool, address(token), 2_000e6, 0);
+        splitShares += core.depositLiquidity(splitPool, address(token), 2_000e6, 0);
+        assertTrue(splitShares <= onceShares + 5);
+    }
+
+    function testWeightBandRejectsADepositThatLeavesTheRange() external {
+        bytes32 usdgId = bytes32("USDG");
+        MockERC20 usdg = new MockERC20("Global Dollar", "USDG", 6);
+        router.setAssetConfig(
+            usdgId, _oracle(address(new MockPriceAdapter(1e18, block.timestamp)), false)
+        );
+        PerpStore.CollateralAsset[] memory assets = new PerpStore.CollateralAsset[](2);
+        assets[0] = PerpStore.CollateralAsset({ token: address(token), assetId: USDC });
+        assets[1] = PerpStore.CollateralAsset({ token: address(usdg), assetId: usdgId });
+        uint32 shared = core.createPool(assets, 7 days);
+        usdg.mint(address(this), 40_000e6);
+        usdg.approve(address(core), type(uint256).max);
+        core.depositLiquidity(shared, address(token), 10_000e6, 0);
+        core.depositLiquidity(shared, address(usdg), 10_000e6, 0);
+        core.setWeightBand(500);
+        vm.expectRevert(PerpStore.WeightBand.selector);
+        core.depositLiquidity(shared, address(token), 5_000e6, 0);
+        assertTrue(core.depositLiquidity(shared, address(token), 1_000e6, 0) > 0);
+    }
+
+    function testClosedMarketBlocksOpensAndAllowsCloses() external {
+        uint256 id = _open();
+        indexOracle.setPriceData(2_000e18, 2_000e18, block.timestamp, false);
+        AceOrderManager manager = AceOrderManager(core.orderManager());
+        vm.prank(trader);
+        uint256 orderId = manager.openPosition(
+            marketId,
+            address(token),
+            2_000e6,
+            10_000e18,
+            true,
+            2_100e18,
+            uint64(block.timestamp + 1 days)
+        );
+        AceOrderManager.OracleUpdate[] memory updates = new AceOrderManager.OracleUpdate[](0);
+        vm.expectRevert();
+        manager.executeOrder(orderId, updates);
+        _marketDecrease(id, 10_000e18, 1_900e18);
     }
 }

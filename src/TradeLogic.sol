@@ -106,9 +106,9 @@ contract TradeLogic is PerpStore {
         address token = p.collateralToken;
         PoolAsset storage asset = _asset(m.poolId, token);
         PriceData memory ip =
-            oracle.getPriceForAction(m.assetId, m.config.maxLiquidationPriceAge, 0);
+            oracle.getPriceAllowingClosed(m.assetId, m.config.maxLiquidationPriceAge, 0);
         PriceData memory cp =
-            oracle.getPriceForAction(asset.assetId, m.config.maxLiquidationPriceAge, 0);
+            oracle.getPriceAllowingClosed(asset.assetId, m.config.maxLiquidationPriceAge, 0);
         uint256 mark = p.isLong ? ip.minPrice : ip.maxPrice;
         int256 equity = _equity(p, m, mark, cp.minPrice, asset.scale);
         if (equity > int256(MathX.mulDiv(p.sizeUsd, m.config.maintenanceMarginWad, WAD))) {
